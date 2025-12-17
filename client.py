@@ -31,7 +31,7 @@ from google.api_core import exceptions
 
 # Get your API key from: https://ai.google.dev/
 # Best practice: Use environment variables or .env file you can get data from env for this api key
-api_key = "your api Key"
+api_key = "Your api key"
 # load_dotenv()  # Load environment variables from .env file
 # api_key = os.getenv("GEMINI_API_KEY")
 
@@ -68,9 +68,6 @@ def sanitize_schema(schema):
 def send_message_with_retry(chat, message):
     """
     Send a message to Gemini with automatic retry on rate limits.
-
-    Handles 429 (ResourceExhausted) errors by waiting and retrying.
-    This is important because free tier has strict rate limits.
 
     Args:
         chat: Gemini chat session object
@@ -169,12 +166,6 @@ async def main():
             # (We handle tool execution ourselves for MCP integration)
             chat = model.start_chat(enable_automatic_function_calling=False)
 
-            # user_query = "Who is free today?"
-            # print(f"\n👤 User asks: '{user_query}'")
-
-            # 7. SEND MESSAGE (Using our new Retry Logic)
-            # response = send_message_with_retry(chat, user_query)
-
             # ================================================================
             # STEP 5: Interactive Chat Loop
             # ================================================================
@@ -196,16 +187,21 @@ async def main():
                 # STEP 6: Tool Execution Loop
                 # ============================================================
                 # Keep processing until we get a text response (not a tool call)
-                while response.candidates and response.candidates.content.parts:
-                    part = response.candidates.content.parts[0]
+                # This allows Gemini to call multiple tools in sequence
+                max_iterations = 10  # Prevent infinite loops
+                iteration = 0
+
+                while response.candidates and response.candidates[0].content.parts and iteration < max_iterations:
+                    iteration += 1
+                    part = response.candidates[0].content.parts[0]
 
                     # Check if Gemini wants to call a tool
-                    if part.function_call:
+                    if hasattr(part, 'function_call') and part.function_call:
                         fc = part.function_call
                         tool_name = fc.name
                         tool_args = fc.args
 
-                        print(f"🤖 Gemini wants to call: {tool_name}({tool_args})")
+                        print(f"\n🔧 [Iteration {iteration}] Gemini wants to call: {tool_name}({dict(tool_args)})")
 
                         try:
                             # ================================================
@@ -216,14 +212,30 @@ async def main():
                                 arguments=dict(tool_args)
                             )
 
-                            # Get the tool output
-                            tool_output = result.content
-                            print(f"📦 Tool Output: {str(tool_output)}")
+                            # ================================================
+                            # Extract text from MCP TextContent objects
+                            # ================================================
+                            # result.content is a list of TextContent objects
+                            # We need to extract the .text property from each one
+                            if result.content:
+                                # Join all text content into a single string
+                                tool_output = "\n".join([
+                                    content.text for content in result.content
+                                    if hasattr(content, 'text')
+                                ])
+                            else:
+                                tool_output = "No output returned"
+
+                            print(f"📦 Tool returned: {tool_output[:200]}{'...' if len(tool_output) > 200 else ''}")
 
                             # ================================================
                             # Send tool result back to Gemini
                             # ================================================
-                            # Gemini needs to see the result to formulate final answer
+                            # Gemini will use this to decide:
+                            # 1. Call another tool, OR
+                            # 2. Generate final text response
+                            print(f"↩️  Sending result back to Gemini...")
+
                             response = send_message_with_retry(
                                 chat,
                                 {
@@ -238,8 +250,12 @@ async def main():
                                 }
                             )
 
+                            # Loop continues - check if Gemini wants to call another tool
+
                         except Exception as e:
                             print(f"❌ Error calling tool {tool_name}: {e}")
+                            print(f"💬 Asking Gemini to continue without this tool...")
+                            # Don't break - let Gemini try to answer anyway
                             break
 
                     else:
@@ -249,14 +265,18 @@ async def main():
                         try:
                             # Extract text response from Gemini
                             text_ans = response.text
-                            print(f"🤖 AI: {text_ans}")
+                            print(f"\n🤖 AI: {text_ans}")
 
                         except ValueError:
                             # Handle case where AI returns empty response
-                            print("🤖 AI: [Task completed, but the AI sent no text summary]")
+                            print("\n🤖 AI: [Task completed, but the AI sent no text summary]")
 
-                        print("-" * 40)
-                        break
+                        print("-" * 60)
+                        break  # Exit the tool loop, ready for next user question
+
+                # Check if we hit max iterations
+                if iteration >= max_iterations:
+                    print(f"\n⚠️  Reached maximum tool call iterations ({max_iterations}). Stopping to prevent infinite loop.")
 
 if __name__ == "__main__":
     asyncio.run(main())
